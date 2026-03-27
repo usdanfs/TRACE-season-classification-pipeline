@@ -116,7 +116,7 @@ The folder `test_data/` contains synthetic test data and one separate SOP with t
 
 This repository contains the code accompanying the manuscript:
 
-**A Four-Stage Pipeline for Objective Season Classification in Humid Tropical Forests: Case study in the Luquillo Experimental Forest, Puerto Rico**  
+**A Four-Stage Framework for Methodical Season Classification in Humid Tropical Forests: Case study in the Luquillo Experimental Forest, Puerto Rico**  
 Daniel Minikaev, Debjani Sihi, Sasha C. Reed, Tana E. Wood  
 Submitted to *Agricultural and Forest Meteorology*
 
