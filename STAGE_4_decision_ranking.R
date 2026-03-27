@@ -33,7 +33,8 @@ suppressPackageStartupMessages({
   library(lubridate)
 })
 
-source("config.R")
+CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config.R")
+source(CONFIG_FILE)
 set.seed(GLOBAL_SEED)
 
 output_dir <- stage_dir(4)
@@ -245,7 +246,7 @@ std_quant_agreement <- function(sl) {
     group_by(driver, k) %>%
     summarise(cid_std = candidate_id[method == "std"][1],
       cid_qtl = candidate_id[method == "quantile"][1],
-      .groups = "drop") %>%filter(!is.na(cid_std), !is.na(cid_qtl))
+      .groups = "drop") %>% filter(!is.na(cid_std), !is.na(cid_qtl))
   pairs %>%
     mutate(metrics = map2(cid_std, cid_qtl, function(c1, c2) {
       s1 <- sl %>%

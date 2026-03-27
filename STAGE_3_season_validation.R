@@ -26,7 +26,8 @@ suppressPackageStartupMessages({
   library(lubridate)
 })
 
-source("config.R")
+CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config.R")
+source(CONFIG_FILE)
 set.seed(GLOBAL_SEED)
 
 output_dir <- stage_dir(3)
@@ -280,8 +281,10 @@ block_flags <- block_stability %>%
     n_blocks    = n(),
     n_collapsed = sum(n_levels_block < k, na.rm = TRUE),
     prop_healthy = (n_blocks - n_collapsed) / n_blocks,
-    min_block_min_bin_prop = min(
-      min_bin_prop_block[is.finite(min_bin_prop_block)], na.rm = TRUE),
+    min_block_min_bin_prop = {
+      vals <- min_bin_prop_block[is.finite(min_bin_prop_block)]
+      if (length(vals) == 0) NA_real_ else min(vals)
+    },
     any_block_extreme_imbalance = any(
       is.finite(min_bin_prop_block) & min_bin_prop_block < S3_MIN_BLOCK_PROP,
       na.rm = TRUE),

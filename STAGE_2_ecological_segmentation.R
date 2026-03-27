@@ -31,7 +31,8 @@ suppressPackageStartupMessages({
   library(segmented)
 })
 
-source("config.R")
+CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config.R")
+source(CONFIG_FILE)
 set.seed(GLOBAL_SEED)
 
 output_dir  <- stage_dir(2)
