@@ -22,8 +22,8 @@
 # =============================================================================
 
 suppressPackageStartupMessages({
-  library(tidyverse)
-  library(lubridate)
+  library(tidyverse)   
+  library(lubridate)   
 })
 
 CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config.R")
@@ -35,7 +35,7 @@ tab_dir    <- file.path(output_dir, "tables")
 dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
 
 # =============================================================================
-# 1. LOAD DATA
+# 1. DATA INPUTS — load Stage 1 and Stage 2 artefacts plus the climate record
 # =============================================================================
 
 season_long               <- readRDS(file.path(stage_dir(1), "season_long.rds"))
@@ -55,13 +55,37 @@ monthly_response <- readRDS(file.path(stage_dir(2), "monthly_response.rds")) %>%
 # Ecological-month window: only months with ecological data
 response_months <- monthly_response %>% distinct(DateMonth)
 
+# Warn when the ecological window is too short for reliable block stability testing.
+# With fewer than 2 × S3_BLOCK_YEARS years, at most one block exists; a single block
+# cannot distinguish temporal instability from genuine absence of a season level.
+n_response_years <- n_distinct(year(response_months$DateMonth))
+if (n_response_years < 2L * S3_BLOCK_YEARS)
+  warning(sprintf(
+    "Ecological window spans only %d year(s); reliable block stability requires >= %d years (%d blocks x %d yr). ",
+    n_response_years, 2L * S3_BLOCK_YEARS, 2L, S3_BLOCK_YEARS),
+    "Block-collapse drop rules may be overly sensitive. Consider extending the response ",
+    "record or increasing S3_BLOCK_YEARS in config.")
+
 # =============================================================================
-# 2. RESTRICT TO ECOLOGICAL WINDOW
+# 2. ECOLOGICAL WINDOW — restrict labels to months covered by the response record
 # =============================================================================
 
 stage1_long <- season_long %>%
   semi_join(response_months, by = "DateMonth") %>%
   dplyr::select(candidate_id, driver, k, method, DateMonth, season)
+
+# Empty stage1_long means the ecological window has no overlap with the climate
+# record. All drop-rule metrics would be NA, and is.finite(NA) = FALSE causes
+# every candidate to silently pass all filters with no valid data.
+if (nrow(stage1_long) == 0)
+  stop("No Stage 1 season labels fall within the ecological measurement window. ",
+       sprintf("Response window: %s--%s. ",
+               format(min(response_months$DateMonth), "%Y-%m"),
+               format(max(response_months$DateMonth), "%Y-%m")),
+       sprintf("Climate record: %s--%s. ",
+               format(min(season_long$DateMonth), "%Y-%m"),
+               format(max(season_long$DateMonth), "%Y-%m")),
+       "Check that RESPONSE_CSV dates overlap with CLIMATE_CSV.")
 
 stage2_long <- ecological_regime_long_seg %>%
   mutate(DateMonth = as.Date(DateMonth)) %>%
@@ -70,10 +94,13 @@ stage2_long <- ecological_regime_long_seg %>%
   dplyr::select(candidate_id, driver, k, method, DateMonth, season)
 
 # =============================================================================
-# 3. HELPER FUNCTIONS
+# 3. VALIDATION UTILITIES — class balance, calendar consistency, block
+#    partitioning, and κ helpers used by the stress tests and filter rules
 # =============================================================================
 
-# Class balance within a season vector
+# Checks whether any season level collapses below a meaningful proportion
+# within the ecological window, where sample sizes are smaller than in the
+# full climate record and imbalance is more likely to appear.
 balance_metrics <- function(season_vec) {
   tab <- table(droplevels(season_vec))
   if (sum(tab) == 0)
@@ -84,7 +111,10 @@ balance_metrics <- function(season_vec) {
          n_levels_used = length(tab))
 }
 
-# Calendar-month consistency
+# Within the ecological window, checks whether each calendar month maps
+# reliably to the same season label across years — the same diagnostic as
+# Stage 1 but applied to the shorter ecological record, where occasional
+# anomalous years can have a larger influence on the consistency score.
 month_consistency <- function(df, season_col = "season") {
   d <- df %>% filter(!is.na(.data[[season_col]]))
   if (nrow(d) == 0)
@@ -100,7 +130,10 @@ month_consistency <- function(df, season_col = "season") {
          min_month_consistency  = min(mm$max_prop))
 }
 
-# Partition dates into non-overlapping year blocks
+# Partitions the record into fixed-length year blocks so that the block
+# stability test is independent of inter-annual autocorrelation. Using
+# blocks rather than individual years avoids flagging candidates that simply
+# have one atypical year — the block must lose an entire season level to fail.
 make_year_blocks <- function(dates, block_years = 2) {
   yrs <- sort(unique(year(dates)))
   blocks <- list(); i <- 1
@@ -111,18 +144,29 @@ make_year_blocks <- function(dates, block_years = 2) {
   blocks
 }
 
-# Cohen's κ from a contingency table
-kappa_cohen <- function(tab) {
-  n <- sum(tab)
-  if (n == 0) return(NA_real_)
-  po <- sum(diag(tab)) / n
-  pe <- sum(rowSums(tab) * colSums(tab)) / n^2
+# Cohen's κ from a contingency table.
+# Squarifies the table over the union of row/column labels before computing,
+# so non-square tables (divergent label sets) are handled correctly rather than
+# silently computing diag() on the shorter diagonal.
+kappa_safe <- function(tab) {
+  tab <- as.matrix(tab)
+  n   <- sum(tab)
+  if (!is.finite(n) || n == 0) return(NA_real_)
+  all_lvls <- union(rownames(tab), colnames(tab))
+  sq <- matrix(0L, length(all_lvls), length(all_lvls),
+               dimnames = list(all_lvls, all_lvls))
+  sq[rownames(tab), colnames(tab)] <- tab
+  rs <- rowSums(sq); cs <- colSums(sq)
+  if (sum(rs > 0) <= 1 || sum(cs > 0) <= 1) return(NA_real_)
+  po <- sum(diag(sq)) / n
+  pe <- sum(rs * cs) / n^2
   if (!is.finite(pe) || isTRUE(all.equal(1 - pe, 0))) return(NA_real_)
   (po - pe) / (1 - pe)
 }
 
 # =============================================================================
-# 4. STRESS TESTS — BLOCK STABILITY AND CALENDAR CONSISTENCY
+# 4. STRUCTURAL STRESS TESTS — block stability and calendar-month consistency
+#    within the ecological window; failures here trigger hard drops in section 8
 # =============================================================================
 
 year_blocks <- make_year_blocks(response_months$DateMonth, block_years = S3_BLOCK_YEARS)
@@ -155,7 +199,8 @@ calendar_consistency_eco <- stage1_long %>%
          min_month_consistency_eco  = min_month_consistency)
 
 # =============================================================================
-# 5. ECOLOGICAL DIFFERENTIATION (ANOVA)
+# 5. ECOLOGICAL DIFFERENTIATION — one-way ANOVA to test whether season levels
+#    correspond to distinct response distributions (informational only)
 # =============================================================================
 # One-way ANOVA of monthly ecological response grouped by season level.
 # Informational flag only — never triggers a drop.
@@ -221,7 +266,8 @@ ecological_anova_flags <- ecological_anova_summary %>%
             flag_low_omega_sq = is.finite(omega_sq) & omega_sq < S3_FLAG_OMEGA_SQ_LOW)
 
 # =============================================================================
-# 6. STAGE 1 vs STAGE 2 AGREEMENT (Validation Signal)
+# 6. THRESHOLD–BREAKPOINT LABEL AGREEMENT — κ between climate-threshold and
+#    ecological-breakpoint season labels over the shared ecological window
 # =============================================================================
 
 stage2_key <- stage2_long %>%
@@ -245,12 +291,13 @@ agreement_tbl <- stage1_long %>%
           by = "DateMonth")
       lv <- union(levels(d$s1), levels(d$s2))
       tab <- table(factor(d$s1, levels = lv), factor(d$s2, levels = lv))
-      tibble(n_months_overlap = sum(tab), kappa = kappa_cohen(tab))
+      tibble(n_months_overlap = sum(tab), kappa = kappa_safe(tab))
     })) %>%
   unnest(metrics)
 
 # =============================================================================
-# 7. THRESHOLD vs BREAKPOINT ALIGNMENT (Validation Signal)
+# 7. THRESHOLD–BREAKPOINT POSITION ALIGNMENT — IQR-normalised distance between
+#    Stage 1 thresholds and Stage 2 breakpoints on the driver axis
 # =============================================================================
 
 stage2_breaks <- seg_tbl %>% transmute(driver, k, b1, b2)
@@ -260,6 +307,15 @@ driver_scale <- monthly_clim %>%
   pivot_longer(-DateMonth, names_to = "driver", values_to = "x") %>%
   summarise(iqr = IQR(x, na.rm = TRUE), .by = driver)
 
+# Warn for constant drivers (IQR = 0): IQR-normalised distance is undefined
+# and would produce Inf. diff1_iqr/diff2_iqr are set to NA_real_ for these.
+zero_iqr_drivers <- driver_scale %>% filter(iqr == 0) %>% pull(driver)
+if (length(zero_iqr_drivers) > 0)
+  warning(sprintf(
+    "Driver(s) with zero IQR (constant over the climate window): %s. ",
+    paste(zero_iqr_drivers, collapse = ", ")),
+    "IQR-normalised alignment distances (diff1_iqr, diff2_iqr) will be NA for these drivers.")
+
 alignment_tbl <- threshold_tbl %>%
   dplyr::select(candidate_id, driver, k, method, t1, t2) %>%
   inner_join(stage2_breaks, by = c("driver", "k")) %>%
@@ -267,11 +323,13 @@ alignment_tbl <- threshold_tbl %>%
   mutate(
     abs_diff_1 = abs(b1 - t1),
     abs_diff_2 = if_else(k == 3, abs(b2 - t2), NA_real_),
-    diff1_iqr  = abs_diff_1 / iqr,
-    diff2_iqr  = if_else(k == 3, abs_diff_2 / iqr, NA_real_))
+    # Use NA rather than Inf when driver is constant (iqr == 0)
+    diff1_iqr  = if_else(iqr > 0, abs_diff_1 / iqr, NA_real_),
+    diff2_iqr  = if_else(k == 3 & iqr > 0, abs_diff_2 / iqr, NA_real_))
 
 # =============================================================================
-# 8. CONSERVATIVE FILTERING
+# 8. DROP-RULE APPLICATION — reject structurally pathological candidates;
+#    flag informational concerns without triggering drops
 # =============================================================================
 # Drop rules target structural pathologies only.
 
@@ -331,7 +389,7 @@ filters_tbl <- screened_tbl %>%
   left_join(ecological_anova_flags,
             by = c("candidate_id", "driver", "k", "method")) %>%
   mutate(
-    # --- Drop rules ---
+    # Drop rules:
     fail_assignment = is.finite(pct_assigned_eco) &
       pct_assigned_eco < S3_MIN_PCT_ASSIGNED,
     fail_imbalance  = is.finite(min_bin_prop_eco) &
@@ -340,16 +398,16 @@ filters_tbl <- screened_tbl %>%
       mean_month_consistency_eco < S3_MEAN_MONTH_CONS,
     fail_block_imbalance = !is.na(any_block_extreme_imbalance) &
       any_block_extreme_imbalance,
-    # --- Flags ---
+    # Informational flags (never trigger a drop):
     flag_kappa_low = is.finite(kappa) & kappa < S3_FLAG_KAPPA_LOW,
     flag_align_far = !is.na(align_flag) & align_flag,
-    # --- Final ---
+    # Final drop decision:
     drop_candidate = fail_assignment | fail_imbalance | fail_calendar |
       (!is.na(fail_block_collapse) & fail_block_collapse) |
       fail_block_imbalance)
 
 # =============================================================================
-# 9. RETAINED CANDIDATES
+# 9. SURVIVOR SET — collect passing candidates for Stage 4 ranking
 # =============================================================================
 
 retained <- filters_tbl %>%
@@ -364,7 +422,7 @@ retained <- filters_tbl %>%
     anova_omega_sq, anova_p, kw_p, flag_low_omega_sq)
 
 # =============================================================================
-# 10. SAVE OUTPUTS
+# 10. OUTPUTS — write diagnostic tables and Stage 4 handshake RDS
 # =============================================================================
 
 write.csv(filters_tbl %>%
@@ -404,10 +462,19 @@ write.csv(ecological_anova_summary %>%
                           n_obs, n_levels, p_value, omega_sq, kw_p),
           file.path(tab_dir, "anova_summary.csv"), row.names = FALSE)
 
-write.csv(posthoc_tbl %>%
-            dplyr::select(candidate_id, driver, n_seasons = k, method,
-                          comparison, diff, lwr, upr, p_adj = `p adj`),
-          file.path(tab_dir, "tukey_posthoc.csv"), row.names = FALSE)
+# Guard: if no k=3 candidates had enough observations for TukeyHSD, posthoc_tbl
+# will have no rows and the Tukey-specific columns will not exist after unnesting.
+# Write an empty-but-valid CSV rather than crashing on a missing-column select.
+posthoc_out <- if (nrow(posthoc_tbl) > 0 && "comparison" %in% names(posthoc_tbl)) {
+  posthoc_tbl %>%
+    dplyr::select(candidate_id, driver, n_seasons = k, method,
+                  comparison, diff, lwr, upr, p_adj = `p adj`)
+} else {
+  tibble(candidate_id = character(), driver = character(), n_seasons = integer(),
+         method = character(), comparison = character(),
+         diff = numeric(), lwr = numeric(), upr = numeric(), p_adj = numeric())
+}
+write.csv(posthoc_out, file.path(tab_dir, "tukey_posthoc.csv"), row.names = FALSE)
 
 write.csv(group_means_tbl %>%
             dplyr::select(candidate_id, driver, n_seasons = k, method,
@@ -430,4 +497,7 @@ write.csv(stage1_vs_stage2 %>%
           row.names = FALSE)
 
 saveRDS(retained, file.path(output_dir, "stage3_stage1_candidates_retained.rds"))
+
+writeLines(capture.output(sessionInfo()),
+           file.path(output_dir, "session_info.txt"))
 # =============================================================================

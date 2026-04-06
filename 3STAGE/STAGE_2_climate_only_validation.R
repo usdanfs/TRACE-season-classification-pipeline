@@ -20,7 +20,10 @@ suppressPackageStartupMessages({
   library(lubridate)
 })
 
-CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config_climate_only.R")
+# Default path uses the 3STAGE/ prefix so the script works when run from the
+# project root directory. When run from inside 3STAGE/, set SEASON_CONFIG
+# explicitly or the file will still be found via the relative path.
+CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "3STAGE/config_climate_only.R")
 source(CONFIG_FILE)
 set.seed(GLOBAL_SEED)
 
@@ -53,6 +56,17 @@ validation_months <- if (use_validation_window) {
 } else {
   monthly_clim %>% distinct(DateMonth)
 }
+
+# Warn when the validation window is too short for reliable block stability testing.
+# With fewer than 2 × S2_BLOCK_YEARS years, at most one block exists; a single block
+# cannot distinguish temporal instability from genuine absence of a season level.
+n_validation_years <- n_distinct(year(validation_months$DateMonth))
+if (n_validation_years < 2L * S2_BLOCK_YEARS)
+  warning(sprintf(
+    "Validation window spans only %d year(s); reliable block stability requires >= %d years (%d blocks x %d yr). ",
+    n_validation_years, 2L * S2_BLOCK_YEARS, 2L, S2_BLOCK_YEARS),
+    "Block-collapse drop rules may be overly sensitive. Consider extending the climate ",
+    "record or increasing S2_BLOCK_YEARS in config.")
 
 # =============================================================================
 # 2. RESTRICT TO VALIDATION WINDOW
@@ -227,4 +241,7 @@ write.csv(retained %>%
 saveRDS(block_stability, file.path(output_dir, "block_stability.rds"))
 saveRDS(filters_tbl,     file.path(output_dir, "filters_tbl.rds"))
 saveRDS(retained,        file.path(output_dir, "stage2_stage1_candidates_retained.rds"))
+
+writeLines(capture.output(sessionInfo()),
+           file.path(output_dir, "session_info.txt"))
 # =============================================================================

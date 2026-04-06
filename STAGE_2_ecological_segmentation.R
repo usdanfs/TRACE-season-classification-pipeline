@@ -25,14 +25,19 @@
 # =============================================================================
 
 suppressPackageStartupMessages({
-  library(tidyverse)
-  library(lubridate)
-  library(zoo)
+  library(tidyverse)   
+  library(lubridate)   
+  library(zoo)        
   library(segmented)
 })
 
 CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config.R")
 source(CONFIG_FILE)
+# Seed note: set.seed() is called once here for the global sequence, and again
+# inside each map() lambda below (once per driver) so that every driver's
+# bootstrap starts from the same seed regardless of evaluation order or the
+# number of drivers.  This makes per-driver results reproducible in isolation
+# but means all drivers share the same initial RNG state for their bootstraps.
 set.seed(GLOBAL_SEED)
 
 output_dir  <- stage_dir(2)
@@ -40,26 +45,73 @@ tab_dir     <- file.path(output_dir, "tables")
 seg_drivers <- as_tibble(SEG_DRIVERS)
 dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
 
+# Internal algorithm constants — change only with care (see comments)
+BOOT_CI_MIN_REPS <- 10L  # min bootstrap replicates required for a CI to be reported
+CV_MIN_TEST_N    <- 3L   # min observations in a leave-one-year-out test fold
+
 # =============================================================================
-# 1. LOAD DATA
+# 1. DATA INPUTS — load the ecological response and join with climate record
 # =============================================================================
 
 monthly_clim <- read.csv(CLIMATE_CSV, stringsAsFactors = FALSE) %>%
   mutate(DateMonth = as.Date(sprintf("%d-%02d-15", Year, Month)))
 
-monthly_response <- read.csv(RESPONSE_CSV, stringsAsFactors = FALSE) %>%
+# Validate RESPONSE_CSV has the expected response column before attempting rename.
+# Missing column gives a cryptic tidyselect error with no pointer to config.
+resp_raw <- read.csv(RESPONSE_CSV, stringsAsFactors = FALSE)
+if (!RESPONSE_COL %in% names(resp_raw))
+  stop("RESPONSE_COL '", RESPONSE_COL, "' not found in RESPONSE_CSV. ",
+       "Available columns: ", paste(names(resp_raw), collapse = ", "))
+
+monthly_response <- resp_raw %>%
   mutate(DateMonth = as.Date(sprintf("%d-%02d-15", Year, Month))) %>%
   rename(RESPONSE_COL = all_of(RESPONSE_COL)) %>%
   left_join(monthly_clim %>%
               dplyr::select(DateMonth, Year, Month, all_of(DRIVER_META$driver)),
             by = c("DateMonth", "Year", "Month")) %>%
   arrange(DateMonth)
+rm(resp_raw)
+
+# No date overlap means all segmented fits will receive empty data and silently
+# return null_results; the ecological regime candidates will be all-NA.
+overlap_n <- sum(monthly_response$DateMonth %in% monthly_clim$DateMonth &
+                   is.finite(monthly_response$RESPONSE_COL))
+if (overlap_n == 0)
+  stop("No overlapping dates with finite response values between RESPONSE_CSV and CLIMATE_CSV. ",
+       sprintf("Response spans %d--%d; Climate spans %d--%d.",
+               min(monthly_response$Year, na.rm = TRUE),
+               max(monthly_response$Year, na.rm = TRUE),
+               min(monthly_clim$Year, na.rm = TRUE),
+               max(monthly_clim$Year, na.rm = TRUE)))
+
+# Warn if total overlapping months are below the segmented-regression minimum.
+if (overlap_n < MIN_MONTHS_FOR_SEG)
+  warning(sprintf(
+    "Only %d months overlap between RESPONSE_CSV and CLIMATE_CSV (MIN_MONTHS_FOR_SEG = %d). ",
+    overlap_n, MIN_MONTHS_FOR_SEG),
+    "All segmented fits will return null results and breakpoint_supported = FALSE.")
+
+# Validate SEG_DRIVERS: all drivers must exist in DRIVER_META (so driver_info()
+# works) and must be present as columns in monthly_response (so fits can run).
+missing_seg_meta <- setdiff(seg_drivers$driver, DRIVER_META$driver)
+if (length(missing_seg_meta) > 0)
+  stop("SEG_DRIVERS contains driver(s) not in DRIVER_META: ",
+       paste(missing_seg_meta, collapse = ", "))
+
+missing_seg_col <- setdiff(seg_drivers$driver, names(monthly_response))
+if (length(missing_seg_col) > 0)
+  stop("SEG_DRIVERS driver(s) not found as columns in monthly_response after joining with climate data: ",
+       paste(missing_seg_col, collapse = ", "),
+       ". Check that these drivers are present in CLIMATE_CSV.")
 
 # =============================================================================
-# 2. HELPER FUNCTIONS
+# 2. SEGMENTATION UTILITIES — label assignment, jitter, bootstrap CI, and
+#    leave-one-year-out CV helpers used by the fitting functions below
 # =============================================================================
 
-# Assign season labels from breakpoint thresholds (polarity from DRIVER_META)
+# Converts ecological breakpoints to season factors using the same polarity
+# convention (lower_closed via high_is_dry) as Stage 1, so Stage 2 labels
+# are directly comparable to Stage 1 labels in the Stage 3 agreement tests.
 season_from_thresholds <- function(df, driver, k, t1, t2 = NA_real_) {
   x  <- df[[driver]]
   dm <- driver_info(driver)
@@ -79,7 +131,7 @@ season_from_thresholds <- function(df, driver, k, t1, t2 = NA_real_) {
       return(factor(rep(NA_character_, nrow(df))))
     if (dm$high_is_dry)
       out <- case_when(!is.finite(x) ~ NA_character_,
-                       x <= t1 ~ dm$label_low, x < t2 ~ dm$label_mid,
+                       x <= t1 ~ dm$label_low, x <= t2 ~ dm$label_mid,
                        TRUE ~ dm$label_high)
     else
       out <- case_when(!is.finite(x) ~ NA_character_,
@@ -90,7 +142,10 @@ season_from_thresholds <- function(df, driver, k, t1, t2 = NA_real_) {
   stop("k must be 2 or 3")
 }
 
-# Jitter tied x-values to aid segmented() convergence
+# segmented() can fail or return degenerate breakpoints when many x-values
+# are identical, because tied values create flat regions in the piecewise
+# likelihood surface. Minimal random jitter (< 1e-6 × SD) breaks ties
+# without meaningfully shifting any breakpoint estimate.
 jitter_if_tied <- function(x, frac = 1e-6) {
   x <- as.numeric(x)
   if (!all(is.finite(x))) return(x)
@@ -101,8 +156,11 @@ jitter_if_tied <- function(x, frac = 1e-6) {
   x
 }
 
-# Bootstrap CI from a numeric vector (95% percentile interval)
-boot_ci <- function(x, min_ok = 10) {
+# Percentile-based bootstrap CI for breakpoint stability. The percentile
+# method is preferred over SE-based intervals here because the bootstrap
+# distribution of breakpoints is often asymmetric; min_ok = 10 ensures
+# the CI is not reported when the bootstrap produced too few valid replicates.
+boot_ci <- function(x, min_ok = BOOT_CI_MIN_REPS) {
   if (length(x) >= min_ok)
     c(median(x), quantile(x, 0.025), quantile(x, 0.975))
   else
@@ -110,22 +168,33 @@ boot_ci <- function(x, min_ok = 10) {
 }
 
 # =============================================================================
-# 3. SEGMENTED REGRESSION FITTING
+# 3. FITTING FUNCTIONS — single- and double-breakpoint segmented regression
+#    with bootstrap; called once per driver in section 4 and again per
+#    leave-one-year-out fold in cv_seg_rmse
 # =============================================================================
-# fit_seg1: single breakpoint (k = 2 seasons)
-# fit_seg2: two breakpoints  (k = 3 seasons)
-#
-# Each returns: breakpoint estimate(s), AIC comparison, bootstrap CI,
-# the working data frame, and the fitted segmented object.
-# When B = 0 (during cross-validation), bootstrap is skipped.
+# fit_seg1 (k = 2) and fit_seg2 (k = 3) are kept as separate functions rather
+# than a single dispatcher so their null_result structures (which differ in the
+# number of bootstrap columns) can be typed explicitly without branching logic.
+# Each returns: breakpoint estimate(s), AIC comparison, bootstrap CI, the
+# working data frame, and the fitted segmented object.
+# When B = 0 (during cross-validation folds), bootstrap is skipped.
 
 fit_seg1 <- function(df, xvar, yvar = "RESPONSE_COL", psi_init = NULL, B = 300) {
   d0 <- df %>% filter(is.finite(.data[[xvar]]), is.finite(.data[[yvar]]))
+  # A near-constant response has zero variance: lm() fits with 0 residual df and
+  # segmented() will either crash or return a meaningless breakpoint.
+  if (nrow(d0) >= 2 && sd(d0[[yvar]], na.rm = TRUE) < .Machine$double.eps^0.5) {
+    warning(sprintf("fit_seg1: '%s' has near-zero variance for driver '%s'. Skipping fit.",
+                    yvar, xvar))
+    d0 <- d0[0L, ]   # force null_result path via nrow < MIN_MONTHS_FOR_SEG
+  }
   null_result <- list(
     ok = FALSE, b1 = NA_real_,
     aic_linear = NA_real_, aic_seg = NA_real_, delta_aic = NA_real_,
+    davies_p = NA_real_,   # must mirror the success-path list structure so
+                           # map_dbl(res, "davies_p") does not crash on null paths
     boot_sum = tibble(b1_med = NA_real_, b1_lo = NA_real_,
-                      b1_hi = NA_real_, n_boot_ok_1 = 0L, davies_p = NA_real_),
+                      b1_hi = NA_real_, n_boot_ok_1 = 0L),
     df0 = d0, seg_fit = NULL)
   if (nrow(d0) < MIN_MONTHS_FOR_SEG) return(null_result)
   d0 <- d0 %>% mutate(xj = jitter_if_tied(.data[[xvar]]))
@@ -140,7 +209,7 @@ fit_seg1 <- function(df, xvar, yvar = "RESPONSE_COL", psi_init = NULL, B = 300) 
   delta_aic  <- aic_linear - aic_seg
   # Davies test for breakpoint existence (handles nuisance parameter)
   davies_p <- tryCatch({
-    dt <- segmented::davies.test(lm0, seg.Z = ~xj, k = 10)
+    dt <- segmented::davies.test(lm0, seg.Z = ~xj, k = DAVIES_K)
     dt$p.value
   }, error = function(e) NA_real_)
   b1 <- NA_real_
@@ -169,18 +238,25 @@ fit_seg1 <- function(df, xvar, yvar = "RESPONSE_COL", psi_init = NULL, B = 300) 
   ci1   <- boot_ci(b1_ok)
   boot_sum <- tibble(b1_med = ci1[1], b1_lo = ci1[2], b1_hi = ci1[3],
                      n_boot_ok_1 = length(b1_ok))
-  list(ok = TRUE, b1 = b1, aic_linear = aic_linear, aic_seg = aic_seg,  davies_p = davies_p,
+  list(ok = TRUE, b1 = b1, aic_linear = aic_linear, aic_seg = aic_seg, davies_p = davies_p,
        delta_aic = delta_aic, boot_sum = boot_sum, df0 = d0, seg_fit = seg0)
 }
 
 fit_seg2 <- function(df, xvar, yvar = "RESPONSE_COL", psi_init = NULL, B = 300) {
   d0 <- df %>% filter(is.finite(.data[[xvar]]), is.finite(.data[[yvar]]))
+  if (nrow(d0) >= 2 && sd(d0[[yvar]], na.rm = TRUE) < .Machine$double.eps^0.5) {
+    warning(sprintf("fit_seg2: '%s' has near-zero variance for driver '%s'. Skipping fit.",
+                    yvar, xvar))
+    d0 <- d0[0L, ]
+  }
   null_result <- list(
     ok = FALSE, b1 = NA_real_, b2 = NA_real_,
     aic_linear = NA_real_, aic_seg = NA_real_, delta_aic = NA_real_,
+    davies_p = NA_real_,   # must mirror the success-path list structure so
+                           # map_dbl(res, "davies_p") does not crash on null paths
     boot_sum = tibble(b1_med = NA_real_, b1_lo = NA_real_, b1_hi = NA_real_,
                       b2_med = NA_real_, b2_lo = NA_real_, b2_hi = NA_real_,
-                      n_boot_ok_1 = 0L, n_boot_ok_2 = 0L, davies_p = NA_real_),
+                      n_boot_ok_1 = 0L, n_boot_ok_2 = 0L),
     df0 = d0, seg_fit = NULL)
   if (nrow(d0) < MIN_MONTHS_FOR_SEG) return(null_result)
   d0 <- d0 %>% mutate(xj = jitter_if_tied(.data[[xvar]]))
@@ -196,7 +272,7 @@ fit_seg2 <- function(df, xvar, yvar = "RESPONSE_COL", psi_init = NULL, B = 300) 
   delta_aic  <- aic_linear - aic_seg
   # Davies test for breakpoint existence (handles nuisance parameter)
   davies_p <- tryCatch({
-    dt <- segmented::davies.test(lm0, seg.Z = ~xj, k = 10)
+    dt <- segmented::davies.test(lm0, seg.Z = ~xj, k = DAVIES_K)
     dt$p.value
   }, error = function(e) NA_real_)
   b1 <- NA_real_; b2 <- NA_real_
@@ -233,19 +309,20 @@ fit_seg2 <- function(df, xvar, yvar = "RESPONSE_COL", psi_init = NULL, B = 300) 
     b1_med = ci1[1], b1_lo = ci1[2], b1_hi = ci1[3],
     b2_med = ci2[1], b2_lo = ci2[2], b2_hi = ci2[3],
     n_boot_ok_1 = length(b1_ok), n_boot_ok_2 = length(b2_ok))
-  list(ok = TRUE, b1 = b1, b2 = b2,  davies_p = davies_p,
+  list(ok = TRUE, b1 = b1, b2 = b2, davies_p = davies_p,
        aic_linear = aic_linear, aic_seg = aic_seg, delta_aic = delta_aic,
        boot_sum = boot_sum, df0 = d0, seg_fit = seg0)
 }
 
-# --- Leave-one-year-out cross-validation RMSE ---
+# Leave-one-year-out cross-validation RMSE: a predictive diagnostic separate
+# from the in-sample AIC comparison, less sensitive to overfitting than ΔAIC.
 cv_seg_rmse <- function(df, xvar, k_breaks) {
   years <- sort(unique(df$Year))
   if (length(years) < 5) return(NA_real_)
   rmses <- map_dbl(years, function(yr) {
     train <- df %>% filter(Year != yr)
     test  <- df %>% filter(Year == yr)
-    if (nrow(test) < 3 || nrow(train) < MIN_MONTHS_FOR_SEG) return(NA_real_)
+    if (nrow(test) < CV_MIN_TEST_N || nrow(train) < MIN_MONTHS_FOR_SEG) return(NA_real_)
     fit <- if (k_breaks == 1) fit_seg1(train, xvar, B = 0)
     else               fit_seg2(train, xvar, B = 0)
     breaks <- c(fit$b1, fit$b2)[is.finite(c(fit$b1, fit$b2))]
@@ -270,10 +347,12 @@ cv_seg_rmse <- function(df, xvar, k_breaks) {
 }
 
 # =============================================================================
-# 4. FIT SEGMENTED REGRESSIONS (3 drivers × 2 k-levels = 6 fits)
+# 4. REGRESSION RUNS — fit all driver × k combinations and extract breakpoints
 # =============================================================================
 
 # k = 2: single breakpoint per driver
+# boot_sum here is a list-column extracted from each fit result; the local
+# variable named boot_sum inside fit_seg1/fit_seg2 is its source value.
 seg1_tbl <- seg_drivers %>%
   mutate(
     res      = map(driver, ~{ set.seed(GLOBAL_SEED); fit_seg1(monthly_response, .x, B = BOOT_B_SEG) }),
@@ -304,11 +383,12 @@ seg_tbl <- bind_rows(
     delta_aic     = map_dbl(res, "delta_aic"),
     davies_p      = map_dbl(res, "davies_p"),
     pass_aic_gain = is.finite(delta_aic) & delta_aic >= MIN_DELTA_AIC,
-    pass_davies   = is.finite(davies_p) & davies_p < 0.05,
+    pass_davies   = is.finite(davies_p) & davies_p < DAVIES_ALPHA,
     breakpoint_supported = pass_aic_gain | pass_davies)
 
 # =============================================================================
-# 5. BUILD ECOLOGICAL-REGIME SEASON LABELS FROM BREAKPOINTS
+# 5. ECOLOGICAL-REGIME LABELS — convert breakpoints to month-level season
+#    factors for cross-validation against Stage 1 labels in Stage 3
 # =============================================================================
 # Convert each breakpoint set into month-level season factors over the full
 # climate record, for cross-validation against Stage 1 labels in Stage 3.
@@ -342,7 +422,7 @@ ecological_regime_long <- ecological_regime_candidates %>%
   mutate(method = "segmented")
 
 # =============================================================================
-# 6. SAVE OUTPUTS
+# 6. OUTPUTS — write breakpoint tables and RDS handshakes for Stage 3
 # =============================================================================
 
 seg_tbl_flat <- seg_tbl %>% dplyr::select(where(~!is.list(.)))
@@ -373,4 +453,7 @@ write.csv(ecological_regime_long %>%
 saveRDS(ecological_regime_long, file.path(output_dir, "ecological_regime_long_seg.rds"))
 saveRDS(seg_tbl,          file.path(output_dir, "seg_tbl.rds"))
 saveRDS(monthly_response,     file.path(output_dir, "monthly_response.rds"))
+
+writeLines(capture.output(sessionInfo()),
+           file.path(output_dir, "session_info.txt"))
 # =============================================================================

@@ -1,11 +1,16 @@
 # =============================================================================
-# config_testdata.R — Pipeline Configuration for Synthetic Test Data
+# config_TRACE.R — Pipeline Configuration for the TRACE Site
 # =============================================================================
-# Configuration for running the full 4-stage pipeline on the synthetic test
-# dataset provided in test_data/.
+# Seasonal classification pipeline configuration for the TRACE experimental
+# site, Luquillo Experimental Forest, Puerto Rico.
 #
 # To use this config, set the environment variable before running any stage:
-#   Sys.setenv(SEASON_CONFIG = "test_data/config_testdata.R")
+#   Sys.setenv(SEASON_CONFIG = "TRAEC_data/config_TRACE.R")
+#
+# Structure:
+#   SECTION 1 — SITE SETTINGS  (site-specific; must be reviewed for every run)
+#   SECTION 2 — METHOD SETTINGS (defaults; edit only with scientific justification)
+#   SECTION 3 — ADVANCED SETTINGS (internal thresholds; do not change lightly)
 # =============================================================================
 
 PROJECT_DIR <- tryCatch(
@@ -21,39 +26,36 @@ DIR_STAGE_4 <- "output_STAGE_4"
 # SECTION 1 — SITE SETTINGS
 # =============================================================================
 
-CLIMATE_CSV  <- file.path(PROJECT_DIR, "test_data", "CLIM_test_alt_1990_2025.csv")
-RESPONSE_CSV <- file.path(PROJECT_DIR, "test_data", "RESPONSE_test_alt_2019_2025.csv")
-RESPONSE_COL <- "ndvi_mean"
+CLIMATE_CSV  <- file.path(PROJECT_DIR, "CLIM_TRACE.csv")
+RESPONSE_CSV <- file.path(PROJECT_DIR, "RESPONSE_TRACE.csv")
+RESPONSE_COL <- "log_flux"
 
 DRIVER_META <- data.frame(
-  driver      = c("VPD_kPa", "SPI_3", "RH_pct", "P3mo_mm"),
-  high_is_dry = c(TRUE,      FALSE,   FALSE,     FALSE),
-  label_low   = c("Wet",     "Dry",   "Dry",     "Dry"),
-  label_high  = c("Dry",     "Wet",   "Wet",     "Wet"),
-  label_mid   = c("Transition", "Transition", "Transition", "Transition"),
+  driver      = c("SPEI",        "CWD",        "Rain_roll"),
+  high_is_dry = c(FALSE,         TRUE,          FALSE),
+  label_low   = c("Dry",         "Wet",         "Dry"),
+  label_high  = c("Wet",         "Dry",         "Wet"),
+  label_mid   = c("Transition",  "Transition",  "Transition"),
   stringsAsFactors = FALSE)
 
-BASELINE_START <- 1998
-BASELINE_END   <- 2018
+BASELINE_START <- 1995
+BASELINE_END   <- 2015
 
 STD_THRESHOLDS <- list(
-  VPD_kPa = list(
-    two   = list(t = 1.05),
-    three = list(t1 = 0.85, t2 = 1.55)),
-  SPI_3 = list(
-    two   = list(t = 0.00),
-    three = list(t1 = -0.80, t2 = 0.80)),
-  RH_pct = list(
-    two   = list(t = 84.0),
-    three = list(t1 = 78.0, t2 = 90.0)),
-  P3mo_mm = list(
-    two   = list(t = 420.0),
-    three = list(t1 = 260.0, t2 = 560.0)))
+  SPEI = list(
+    two   = list(t = 0),
+    three = list(t1 = -1, t2 = 1)),
+  CWD = list(
+    two   = list(t = 0),
+    three = list(t1 = 0, t2 = 20)),
+  Rain_roll = list(
+    two   = list(t = 300),
+    three = list(t1 = 180, t2 = 300)))
 
 SEG_DRIVERS <- data.frame(
-  driver = c("VPD_kPa", "SPI_3", "RH_pct", "P3mo_mm"),
-  psi1   = c(1.00,      -0.50,   82.0,     360.0),
-  psi2   = c(1.45,       0.40,   89.0,     520.0),
+  driver = c("Rain_roll", "CWD",  "SPEI"),
+  psi1   = c(300,          10,    -1),
+  psi2   = c(600,          30,     0),
   stringsAsFactors = FALSE)
 
 W_CLIMATE <- 0.50

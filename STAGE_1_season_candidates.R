@@ -23,9 +23,9 @@
 # =============================================================================
 
 suppressPackageStartupMessages({
-  library(tidyverse)
-  library(lubridate)
-  library(zoo)
+  library(tidyverse)   
+  library(lubridate)   
+  library(zoo)         
 })
 
 CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config.R")
@@ -37,7 +37,7 @@ tab_dir    <- file.path(output_dir, "tables")
 dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
 
 # =============================================================================
-# 1. LOAD CLIMATE DATA
+# 1. CLIMATE INPUTS — load and validate the monthly driver record
 # =============================================================================
 # Input CSV must contain Year, Month, and all DRIVER_META$driver columns.
 # Computed indices (e.g. SPEI, rolling sums, CWD) should be pre-derived.
@@ -50,23 +50,65 @@ missing_drv <- setdiff(DRIVER_META$driver, names(monthly_clim))
 if (length(missing_drv) > 0)
   stop("Drivers missing from climate CSV: ", paste(missing_drv, collapse = ", "))
 
+# Warn on duplicate Year-Month rows: metrics are computed per calendar month and
+# duplicate rows silently inflate counts and distort class-balance metrics.
+dup_ym <- monthly_clim %>% count(Year, Month) %>% filter(n > 1)
+if (nrow(dup_ym) > 0)
+  warning(sprintf(
+    "Climate CSV has %d duplicate Year-Month combination(s) (e.g. %d-%02d). ",
+    nrow(dup_ym), dup_ym$Year[1], dup_ym$Month[1]),
+    "Season metrics may be inflated. Deduplicate the CSV before running.")
+
 baseline_months <- monthly_clim %>%
   filter(Year >= BASELINE_START, Year <= BASELINE_END)
 
+# An empty baseline means all quantile thresholds will be NA, producing only
+# degenerate candidates and a silent all-NA failure downstream.
+if (nrow(baseline_months) == 0)
+  stop(sprintf(
+    "Baseline period %d--%d produced no rows. ",
+    BASELINE_START, BASELINE_END),
+    sprintf("Climate CSV spans %d--%d. Adjust BASELINE_START / BASELINE_END.",
+            min(monthly_clim$Year, na.rm = TRUE),
+            max(monthly_clim$Year, na.rm = TRUE)))
+
+# Fewer than 24 baseline months makes quantile thresholds statistically unreliable.
+n_baseline_finite <- baseline_months %>%
+  dplyr::select(all_of(DRIVER_META$driver)) %>%
+  summarise(across(everything(), ~sum(is.finite(.)))) %>%
+  unlist()
+if (any(n_baseline_finite < 24))
+  warning("Baseline period has <24 finite values for driver(s): ",
+          paste(names(n_baseline_finite)[n_baseline_finite < 24], collapse = ", "),
+          ". Quantile thresholds for these drivers will be NA (degenerate candidates).")
+
 # =============================================================================
-# 2. HELPER FUNCTIONS
+# 2. SEASON-LABELLING UTILITIES — threshold assignment, quantile extraction,
+#    and display rounding used throughout candidate generation
 # =============================================================================
 
-# Assign two-level season labels from a single threshold
+# Polarity-aware two-level labeller. lower_closed = TRUE for drivers where
+# high values indicate dry conditions (e.g. CWD), so the threshold value
+# itself falls in the "low" (wet) bin rather than the "high" (dry) bin.
+# This keeps the boundary convention consistent with high_is_dry polarity.
+# Guard: when t is non-finite (e.g. NA_real_ from an under-powered baseline),
+# return all-NA rather than silently assigning every finite x to the "high"
+# bin (which is what case_when does when x <= NA evaluates to NA and falls
+# through to the TRUE clause).
 assign_2season <- function(x, t, low = "Low", high = "High",
                            lower_closed = FALSE) {
+  if (!is.finite(t)) return(rep(NA_character_, length(x)))
   if (lower_closed)
     case_when(!is.finite(x) ~ NA_character_, x <= t ~ low, TRUE ~ high)
   else
     case_when(!is.finite(x) ~ NA_character_, x < t ~ low, TRUE ~ high)
 }
 
-# Assign three-level season labels from two thresholds
+# Three-level generalisation of assign_2season. The same lower_closed
+# convention applies at both boundaries so polarity is handled identically
+# regardless of k. Returns all-NA if thresholds are non-finite or degenerate
+# (t1 >= t2), which cascades to a screened-out candidate rather than silent
+# mis-labelling.
 assign_3season <- function(x, t1, t2, low = "Low", mid = "Mid",
                            high = "High", lower_closed = FALSE) {
   if (!is.finite(t1) || !is.finite(t2)) return(rep(NA_character_, length(x)))
@@ -82,14 +124,19 @@ assign_3season <- function(x, t1, t2, low = "Low", mid = "Mid",
               x < t1 ~ low, x < t2 ~ mid, TRUE ~ high)
 }
 
-# Robust quantiles requiring ≥ 24 finite values
+# Enforces a 24-observation minimum before computing quantile thresholds.
+# Below 24 values the empirical quantile is too noisy to anchor a stable
+# boundary; returning NA cascades to a degenerate candidate rather than a
+# spurious-but-finite threshold that could survive screening.
 get_q <- function(x, probs, type = 8) {
   x <- x[is.finite(x)]
   if (length(x) < 24) return(rep(NA_real_, length(probs)))
   as.numeric(quantile(x, probs = probs, na.rm = TRUE, names = FALSE, type = type))
 }
 
-# Round for display: suppress near-zero noise, adaptive precision
+# Rounds thresholds for CSV display only — not used for classification.
+# Suppresses near-zero floating-point noise and adapts decimal places to
+# magnitude, so the output CSV is human-readable without false precision.
 clean_num <- function(x) {
   case_when(is.na(x) ~ NA_real_,
             abs(x) < 0.001 ~ 0,
@@ -98,7 +145,7 @@ clean_num <- function(x) {
 }
 
 # =============================================================================
-# 3. BUILD SEASON CANDIDATES
+# 3. CANDIDATE GENERATION — cross driver × k × method to produce all label series
 # =============================================================================
 # For each driver × k × method, assign a season label to every month.
 # Polarity-aware: for inverted drivers (high = Dry); or natural (high = Wet).
@@ -137,23 +184,44 @@ build_candidate <- function(df, driver, k_seasons = 2,
     if (length(xb) < 24) {
       meta$t1 <- NA_real_
     } else {
+      # For high_is_dry drivers (e.g. CWD), exact zeros represent "no deficit"
+      # and cluster at the floor of the distribution.  Replacing 0 with a small
+      # positive value (1e-6) prevents the median from collapsing to 0 when
+      # >50% of baseline months are zero, while still placing the threshold at
+      # effectively 0 for practical classification purposes.
+      # NOTE — zero-jitter asymmetry: k=2 uses zero-jittered xb_q for the
+      # quantile split, but k=3 (high_is_dry branch below) uses raw xb for t1
+      # (median) and restricts t2 to strictly positive values only. This is
+      # intentional: the k=3 design places t1 at the natural zero boundary
+      # rather than the Q_SPLIT_2S percentile, giving a distinct biological
+      # interpretation (Wet = zero-deficit; Transition/Dry = positive deficit).
       xb_q <- if (dm$high_is_dry) ifelse(xb == 0, 1e-6, xb) else xb
-      meta$t1 <- suppressWarnings(as.numeric(quantile(xb_q, 0.5, na.rm = TRUE)))
+      meta$t1 <- suppressWarnings(as.numeric(quantile(xb_q, Q_SPLIT_2S, na.rm = TRUE)))
     }
-    out <- assign_2season(x, t = meta$t1, low = labels[1], high = labels[2])
+    out <- assign_2season(x, t = meta$t1, low = labels[1], high = labels[2],
+                          lower_closed = dm$high_is_dry)
   } else {
     if (dm$high_is_dry) {
+      # t1 = median of all baseline values (including zeros, which represent
+      # "no deficit" months and correctly anchor the lower boundary).
+      # t2 = Q_HID_T2 percentile of strictly positive baseline values only; this
+      # places the Dry/Transition boundary within the deficit-bearing months,
+      # separating moderate from high water-stress months.  Q_HID_T2 defaults to
+      # 0.66, matching the ~2/3 split used for the non-high_is_dry case (tertiles).
+      # Adjust Q_HID_T2 in config with caution and document any deviation.
       xb_pos <- xb[xb > 0]
       meta$t1 <- if (length(xb) >= 24)
         suppressWarnings(as.numeric(quantile(xb, 0.50, na.rm = TRUE))) else NA_real_
       meta$t2 <- if (length(xb_pos) >= 24)
-        suppressWarnings(as.numeric(quantile(xb_pos, 0.66, na.rm = TRUE))) else NA_real_
+        suppressWarnings(as.numeric(quantile(xb_pos, Q_HID_T2, na.rm = TRUE))) else NA_real_
     } else {
-      q <- get_q(xb, probs = c(1/3, 2/3))
+      # t1/t2 = tertiles (33rd/67th percentiles) of baseline: equal-sized bins.
+      q <- get_q(xb, probs = Q_SPLIT_3S)
       meta$t1 <- q[1]; meta$t2 <- q[2]
     }
     out <- assign_3season(x, meta$t1, meta$t2,
-                          low = labels[1], mid = labels[2], high = labels[3])
+                          low = labels[1], mid = labels[2], high = labels[3],
+                          lower_closed = dm$high_is_dry)
   }
   list(season = out, meta = meta)
 }
@@ -187,7 +255,8 @@ threshold_tbl <- season_long %>%
   mutate(across(c(t1, t2), clean_num))
 
 # =============================================================================
-# 4. CLIMATE-STRUCTURE VALIDATION METRICS
+# 4. STRUCTURAL DIAGNOSTICS — temporal persistence, switching rate, calendar
+#    consistency, and class balance over the full climate record
 # =============================================================================
 # Four complementary metrics per candidate over the full record:
 #   (a) Temporal persistence  — median run length
@@ -196,6 +265,8 @@ threshold_tbl <- season_long %>%
 #                               dominant season (mean and min across months)
 #   (d) Class balance         — minimum bin proportion and normalised entropy
 
+# Long unbroken runs indicate that the season definition does not oscillate
+# on a sub-seasonal timescale — a necessary property for ecological relevance.
 run_metrics <- function(season_vec) {
   s <- as.character(season_vec)
   s <- s[!is.na(s)]
@@ -203,6 +274,9 @@ run_metrics <- function(season_vec) {
   median(rle(s)$lengths)
 }
 
+# High switching per year suggests the threshold lies in a region of high
+# driver density and produces noisy, rapidly alternating labels — a sign
+# the boundary is not ecologically meaningful.
 switch_metrics <- function(df, season_col) {
   d <- df %>% arrange(DateMonth)
   if (nrow(d) == 0) return(NA_real_)
@@ -215,6 +289,10 @@ switch_metrics <- function(df, season_col) {
     pull(mean_switch_per_year)
 }
 
+# A coherent season definition should map each calendar month to the same
+# label across most years. Low consistency implies the boundary is not
+# aligned with the seasonal cycle, so the classification captures noise
+# rather than a repeatable phenological pattern.
 month_consistency <- function(df, season_col) {
   d <- df %>% filter(!is.na(.data[[season_col]]))
   if (nrow(d) == 0) {
@@ -233,6 +311,9 @@ month_consistency <- function(df, season_col) {
     min_month_consistency  = min(mm$max_prop, na.rm = TRUE))
 }
 
+# Checks that no season level dominates to near-totality. A heavily
+# imbalanced candidate inflates agreement metrics on the majority class
+# and provides little discriminatory information for ecological analysis.
 balance_metrics <- function(season_vec) {
   tab <- table(droplevels(season_vec))
   if (sum(tab) == 0) {
@@ -268,7 +349,7 @@ validation_tbl <- season_long %>%
   ungroup()
 
 # =============================================================================
-# 5. DEGENERACY SCREENING
+# 5. DEGENERACY FILTER — remove candidates that fail minimum structural quality
 # =============================================================================
 # Remove candidates with < 90% months assigned, fewer than k levels
 # realised, or smallest bin below minimum count.
@@ -284,7 +365,25 @@ screened_tbl <- validation_tbl %>%
 
 # Stop if all candidates fail screening
 if (nrow(screened_tbl) == 0) {
-  stop("Stage 1 screening removed all candidates. Review DRIVER_META, STD_THRESHOLDS, and the baseline period.")
+  fail_summary <- validation_tbl %>%
+    mutate(
+      min_bin_n     = round(min_bin_prop * n_assigned),
+      min_bin_n_req = if_else(k == 2, S1_MIN_BIN_N_2S, S1_MIN_BIN_N_3S),
+      fail_pct      = pct_assigned < S1_MIN_PCT_ASSIGNED,
+      fail_levels   = n_levels_used < k,
+      fail_bin      = min_bin_n < min_bin_n_req) %>%
+    summarise(
+      n_fail_pct    = sum(fail_pct),
+      n_fail_levels = sum(fail_levels),
+      n_fail_bin    = sum(fail_bin))
+  stop(sprintf(
+    "Stage 1 screening removed all %d candidate(s). ",
+    nrow(validation_tbl)),
+    sprintf("Failures: pct_assigned=%d, n_levels=%d, min_bin_n=%d. ",
+            fail_summary$n_fail_pct,
+            fail_summary$n_fail_levels,
+            fail_summary$n_fail_bin),
+    "Review DRIVER_META, STD_THRESHOLDS, and BASELINE_START/BASELINE_END.")
 }
 
 # Log removed candidates with failure reasons
@@ -303,7 +402,7 @@ message("Stage 1: ", nrow(screened_tbl), " candidates pass screening (",
         nrow(removed_tbl), " removed).")
 
 # =============================================================================
-# 6. SAVE OUTPUTS
+# 6. OUTPUTS — write diagnostic tables and RDS handshakes for Stages 2–4
 # =============================================================================
 
 write.csv(season_long %>%
@@ -336,4 +435,10 @@ write.csv(removed_tbl %>%
 saveRDS(screened_tbl,   file.path(output_dir, "screened_tbl.rds"))
 saveRDS(threshold_tbl,  file.path(output_dir, "threshold_tbl.rds"))
 saveRDS(season_long,    file.path(output_dir, "season_long.rds"))
+
+# Session info — saved in every stage output directory so that each stage's
+# package environment is independently recorded. Stage 1 always runs first;
+# all subsequent stages also write session_info.txt to their own output_dir.
+writeLines(capture.output(sessionInfo()),
+           file.path(output_dir, "session_info.txt"))
 # =============================================================================

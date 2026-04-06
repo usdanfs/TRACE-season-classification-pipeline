@@ -9,7 +9,7 @@ This repository contains:
 
 ## Software
 
-The pipeline was developed in **R**. Package requirements are loaded within the scripts.
+The pipeline is written in **R**. Package requirements are loaded within the scripts.
 
 ## Overview
 
@@ -28,9 +28,6 @@ The pipeline selects a season definition from a predefined candidate set using c
 
 ## Core repository files
 
-### Shared configuration
-- `config.R`
-
 ### Full 4-stage pipeline (run in this order)
 - `config.R`
 - `STAGE_1_season_candidates.R`
@@ -40,14 +37,16 @@ The pipeline selects a season definition from a predefined candidate set using c
 - `FINAL_season_assignment.R`
 
 ### Climate-only 3-stage pipeline (run in this order)
-- `config_climate_only.R`
-- `STAGE_1_climate_only_candidates.R`
-- `STAGE_2_climate_only_validation.R`
-- `STAGE_3_climate_only_ranking.R
+Scripts for this pipeline are in the `3STAGE/` subfolder.
+- `3STAGE/config_climate_only.R`
+- `3STAGE/STAGE_1_climate_only_candidates.R`
+- `3STAGE/STAGE_2_climate_only_validation.R`
+- `3STAGE/STAGE_3_climate_only_ranking.R`
 - `FINAL_season_assignment.R`
 
 ### General documentation
-- `SOP_Season_Pipeline.docx`
+- `SOP_Pipeline.docx` — step-by-step procedural guide: how to set up your data, fill in `config.R`, run the stages in order, and check outputs. Start here for a new study.
+- `PIPELINE_OUTPUTS_GUIDE.md` — reference guide for interpreting every output column and CSV file (benchmarks, flag meanings, climate-only differences). Read this after your first run to understand what the numbers mean.
 
 ## Input requirements
 
@@ -68,33 +67,51 @@ Two input tables are required:
 ### Climate-only 3-stage pipeline
 One monthly climate table is required:
 - one row per `Year`–`Month`
-- required columns defined in `config_climate_only.R`
+- required columns defined in `3STAGE/config_climate_only.R`
 
 ## General configuration
 
-All site-specific settings are edited in config.
-- project directory and file paths
-- climate drivers and polarity
-- standard thresholds
-- baseline period
-- ecological response column and related settings
-- scoring weights and bootstrap settings
+All site-specific settings are edited in the config file (not in the stage scripts). Open the config file for your pipeline version and review all parameters before the first run:
+- `config.R` for the full 4-stage pipeline
+- `3STAGE/config_climate_only.R` for the climate-only pipeline
 
-At minimum, users must review:
-- `CLIMATE_CSV`
-- `RESPONSE_CSV` (full pipeline only)
-- `RESPONSE_COL` (full pipeline only)
-- `DRIVER_META`
-- `STD_THRESHOLDS`
-- `SEG_DRIVERS` (full pipeline only)
+At minimum, review and set:
+- `CLIMATE_CSV` and `RESPONSE_CSV` / `RESPONSE_COL` (full pipeline only)
+- `DRIVER_META` — driver names, polarity, and season labels
+- `STD_THRESHOLDS` — literature-based classification thresholds
+- `SEG_DRIVERS` and initial breakpoint guesses (full pipeline only)
 - `BASELINE_START`, `BASELINE_END`
-- stage thresholds and tier weights
+- Tier weights (`W_CLIMATE`, `W_ROBUST`, `W_VERIFY`)
 
 Driver names must match exactly across:
-- the climate CSV
+- the climate CSV column headers
 - `DRIVER_META`
 - `STD_THRESHOLDS`
 - `SEG_DRIVERS` (full pipeline only)
+
+### Switching config files without editing scripts
+
+Set the `SEASON_CONFIG` environment variable before sourcing any stage script to point to a different config file:
+
+```r
+Sys.setenv(SEASON_CONFIG = "TRAEC_data/config_TRACE.R")
+source("STAGE_1_season_candidates.R")
+```
+
+If `SEASON_CONFIG` is not set, each script defaults to `config.R` (full pipeline) or `3STAGE/config_climate_only.R` (climate-only pipeline; path includes the subfolder prefix so scripts can be run from the project root).
+
+## Pipeline outputs
+
+The final deliverable is `season_assignment_final.csv` written to the project root directory by `FINAL_season_assignment.R`.
+
+| Column | Description |
+|--------|-------------|
+| `Year` | Calendar year |
+| `Month` | Calendar month (1–12) |
+| `season` | Season label assigned to this month (e.g. "Wet", "Dry", "Transition") |
+| `candidate_id` | Identifier of the winning season definition |
+
+All intermediate diagnostic outputs are written to `output_STAGE_1/` through `output_STAGE_4/` (or `output_STAGE_1_climate_only_candidates/` etc. for the 3-stage pipeline). See `PIPELINE_OUTPUTS_GUIDE.md` for a full description of every output column and recommended interpretation benchmarks.
 
 ## Reproducibility notes
 
@@ -105,39 +122,35 @@ Driver names must match exactly across:
 
 ## Test data
 
-The folder `test_data/` contains synthetic test data and one separate SOP with the exact config adjustments required to run that dataset successfully:
+The folder `test_data/` contains synthetic test data and a dedicated SOP describing the exact config adjustments required to run that dataset:
 
 - `test_data/CLIM_test_alt_1990_2025.csv`
 - `test_data/RESPONSE_test_alt_2019_2025.csv`
 - `test_data/SOP_TestData_ConfigAdjustment.docx`
-- `config_testdata.R`
+- `test_data/config_testdata.R`
 
 ## Code availability
 
 This repository contains the code accompanying the manuscript:
 
-**A Four-Stage Fraemwork for Methodical Season Classification in Humid Tropical Forests: Case study in the Luquillo Experimental Forest, Puerto Rico**  
-Daniel Minikaev, Debjani Sihi, Sasha C. Reed, Tana E. Wood  
+**A Four-Stage Fraemwork for Methodical Season Classification in Humid Tropical Forests: Case study in the Luquillo Experimental Forest, Puerto Rico**
+Daniel Minikaev, Debjani Sihi, Sasha C. Reed, Tana E. Wood
 Submitted to *Agricultural and Forest Meteorology*
 
 ## Manuscript data
 
 This repository contains the code used to classify season definitions at the TRACE site in the Luquillo Experimental Forest, Puerto Rico.
 
-The folder `TRACE_data/` contains the TRACE climate and ecological data used to classify season definitions at the site in the Luquillo Experimental Forest, PR.
-An SOP with the exact config adjustments required to run that dataset successfully, and the dedicated config are provided.
+The folder `TRACE_data/` contains the TRACE climate and ecological data used in the manuscript, along with a dedicated SOP and config file:
 
-- `SOP_ManuscriptData_ConfigAdjustment.docx`
-- `test_data/CLIM_TRACE.csv`
-- `test_data/RESPONSE_TRACE.csv`
-- `config_TRACE.R`
+- `TRACE_data/SOP_ManuscriptData_ConfigAdjustment.docx`
+- `TRACE_data/CLIM_TRACE.csv`
+- `TRACE_data/RESPONSE_TRACE.csv`
+- `TRACE_data/config_TRACE.R`
 
 ## Citation
 
-If you use this code, please cite the manuscript and this repository release.
-
-Manuscript citation:
-> Minikaev, D., Sihi, D., Reed, S. C., & Wood, T. E. Submitted. A Four-Stage Framework for Methodical Season Classification in Humid Tropical Forests: Case study in the Luquillo Experimental Forest, Puerto Rico. *Agricultural and Forest Meteorology*.
+If you use this code, please cite this repository release.
 
 Repository citation:
 > Minikaev, D. 2026. Season Classification Pipeline (Version 1.0.0) [R 4.5.1]. GitHub.

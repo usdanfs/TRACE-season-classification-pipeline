@@ -23,7 +23,10 @@ suppressPackageStartupMessages({
   library(zoo)
 })
 
-CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config_climate_only.R")
+# Default path uses the 3STAGE/ prefix so the script works when run from the
+# project root directory. When run from inside 3STAGE/, set SEASON_CONFIG
+# explicitly or the file will still be found via the relative path.
+CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "3STAGE/config_climate_only.R")
 source(CONFIG_FILE)
 set.seed(GLOBAL_SEED)
 
@@ -128,24 +131,34 @@ build_candidate <- function(df, driver, k_seasons = 2, method = c("std", "quanti
     if (length(xb) < 24) {
       meta$t1 <- NA_real_
     } else {
+      # For high_is_dry drivers (e.g. CWD), exact zeros represent "no deficit"
+      # and cluster at the floor of the distribution. Replacing 0 with 1e-6
+      # prevents the median collapsing to 0 when >50% of months are zero.
+      # NOTE — zero-jitter asymmetry: k=2 uses zero-jittered xb_q for the
+      # quantile split, but k=3 (high_is_dry branch below) uses raw xb for t1.
+      # This is intentional: the k=3 design places t1 at the natural zero
+      # boundary, giving a distinct biological interpretation (Wet = zero-deficit;
+      # Transition/Dry = positive deficit). See main STAGE_1 for full rationale.
       xb_q <- if (dm$high_is_dry) ifelse(xb == 0, 1e-6, xb) else xb
-      meta$t1 <- suppressWarnings(as.numeric(quantile(xb_q, 0.5, na.rm = TRUE)))
+      meta$t1 <- suppressWarnings(as.numeric(quantile(xb_q, Q_SPLIT_2S, na.rm = TRUE)))
     }
-    out <- assign_2season(x, t = meta$t1, low = labels[1], high = labels[2])
+    out <- assign_2season(x, t = meta$t1, low = labels[1], high = labels[2],
+                          lower_closed = dm$high_is_dry)
   } else {
     if (dm$high_is_dry) {
       xb_pos <- xb[xb > 0]
       meta$t1 <- if (length(xb) >= 24)
-        suppressWarnings(as.numeric(quantile(xb, 0.50, na.rm = TRUE))) else NA_real_
+        suppressWarnings(as.numeric(quantile(xb, Q_SPLIT_2S, na.rm = TRUE))) else NA_real_
       meta$t2 <- if (length(xb_pos) >= 24)
-        suppressWarnings(as.numeric(quantile(xb_pos, 0.66, na.rm = TRUE))) else NA_real_
+        suppressWarnings(as.numeric(quantile(xb_pos, Q_HID_T2, na.rm = TRUE))) else NA_real_
     } else {
-      q <- get_q(xb, probs = c(1/3, 2/3))
+      q <- get_q(xb, probs = Q_SPLIT_3S)
       meta$t1 <- q[1]
       meta$t2 <- q[2]
     }
     out <- assign_3season(x, meta$t1, meta$t2,
-                          low = labels[1], mid = labels[2], high = labels[3])
+                          low = labels[1], mid = labels[2], high = labels[3],
+                          lower_closed = dm$high_is_dry)
   }
 
   list(season = out, meta = meta)

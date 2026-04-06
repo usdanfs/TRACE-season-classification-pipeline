@@ -1,7 +1,6 @@
 # =============================================================================
 # FINAL — Season Assignment from Pipeline Winner
 # =============================================================================
-# Purpose:
 #   Read the pipeline winner from the bootstrap rank summary and produce a
 #   clean, publication-ready CSV mapping every month to its assigned season
 #   label.  This is the file you join to your data for downstream analysis.
@@ -21,8 +20,14 @@ suppressPackageStartupMessages({
 })
 
 # ---------------------------------------------------------------------------
-# 0.  CONFIGURATION — edit ONE of the two lines below
+# 0.  CONFIGURATION
 # ---------------------------------------------------------------------------
+# No editing is needed here for standard use.
+# The config file is read from the SEASON_CONFIG environment variable
+# (default: "config.R" for the full pipeline, or set it to
+# "3STAGE/config_climate_only.R" for the climate-only pipeline).
+# The pipeline version is detected automatically from the config: if DIR_STAGE_4
+# is defined, the Stage 4 ranking output is used; otherwise Stage 3 is used.
 CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config.R")
 source(CONFIG_FILE)
 set.seed(GLOBAL_SEED)
@@ -55,6 +60,11 @@ if (!is.na(boot_csv_4) && file.exists(boot_csv_4)) {
 
 boot_summary <- read.csv(boot_csv, stringsAsFactors = FALSE)
 
+if (nrow(boot_summary) == 0 || is.na(boot_summary$top_candidate[1]))
+  stop("bootstrap_rank_summary.csv contains no winner. ",
+       "The ranking stage may have run with no surviving candidates. ",
+       "Re-run the ranking stage and check for upstream errors.")
+
 winner_id <- boot_summary$top_candidate[1]
 message("Pipeline winner: ", winner_id)
 
@@ -68,6 +78,10 @@ threshold_tbl <- readRDS(file.path(stage_dir(1), "threshold_tbl.rds"))
 winner_meta <- threshold_tbl %>%
   filter(candidate_id == winner_id) %>%
   slice(1)
+
+if (nrow(winner_meta) == 0)
+  stop("Winner '", winner_id, "' not found in threshold_tbl.rds from Stage 1. ",
+       "Ensure Stage 1 was run with the same config and that its output files are intact.")
 
 message("  Driver : ", winner_meta$driver,
         "\n  k      : ", winner_meta$k,
@@ -85,6 +99,11 @@ season_final <- season_long %>%
     season       = as.character(season),
     candidate_id = winner_id) %>%
   arrange(Year, Month)
+
+if (nrow(season_final) == 0)
+  stop("No labelled months found for winner '", winner_id, "' in season_long.rds. ",
+       "The candidate may have been screened out or the season labels are all NA. ",
+       "Re-run Stage 1 and check screened_out_candidates.csv.")
 
 # =============================================================================
 # 4. SUMMARY

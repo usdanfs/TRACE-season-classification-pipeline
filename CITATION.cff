@@ -5,23 +5,23 @@ type: software
 authors:
     - family-names: "Minikaev"
       given-names: "Daniel"
-repository-code: "https://github.com/usdanfs/TRACE-season-classification-pipeline.git"
-url: "https://github.com/usdanfs/TRACE-season-classification-pipeline.git"
+repository-code: "https://github.com/daniembs/TRACE-season-classification-pipeline.git"
+url: "https://github.com/daniembs/TRACE-season-classification-pipeline.git"
 license: "MIT"
 version: "1.0.0"
 date-released: 2026-03-27
 abstract: "Reproducible R pipeline for hydroclimate-centred season classification in humid tropical forests and elsewhere, with optional ecological breakpoint verification and a climate-only version."
-article-citation:
-  type: article
-  authors:
-    - family-names: "Minikaev"
-      given-names: "Daniel"
-    - family-names: "Sihi"
-      given-names: "Debjani"
-    - family-names: "C. Reed"
-      given-names: "Sasha"
-    - family-names: "E. Wood"
-      given-names: "Tana"
-  title: "A Four-Stage Framework for Methodical Season Classification in Humid Tropical Forests: Case study in the Luquillo Experimental Forest, Puerto Rico"
-  journal: "Agricultural and Forest Meteorology"
-  status: "submitted"
+references:
+  - type: article
+    authors:
+      - family-names: "Minikaev"
+        given-names: "Daniel"
+      - family-names: "Sihi"
+        given-names: "Debjani"
+      - family-names: "Reed"
+        given-names: "Sasha C."
+      - family-names: "Wood"
+        given-names: "Tana E."
+    title: "A Four-Stage Framework for Analytical Season Classification in Humid Tropical Forests: Case study in the Luquillo Experimental Forest, Puerto Rico"
+    journal: "Agricultural and Forest Meteorology"
+    status: "submitted"

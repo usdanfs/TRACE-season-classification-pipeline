@@ -21,7 +21,10 @@ suppressPackageStartupMessages({
   library(lubridate)
 })
 
-CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "config_climate_only.R")
+# Default path uses the 3STAGE/ prefix so the script works when run from the
+# project root directory. When run from inside 3STAGE/, set SEASON_CONFIG
+# explicitly or the file will still be found via the relative path.
+CONFIG_FILE <- Sys.getenv("SEASON_CONFIG", unset = "3STAGE/config_climate_only.R")
 source(CONFIG_FILE)
 set.seed(GLOBAL_SEED)
 
@@ -65,7 +68,9 @@ kappa_safe <- function(tab) {
   (po - pe) / (1 - pe)
 }
 
-wilson_ci <- function(m, n, z = 1.96) {
+WILSON_Z <- 1.96  # z for 95% two-sided Wilson CI (qnorm(0.975))
+
+wilson_ci <- function(m, n, z = WILSON_Z) {
   if (!is.finite(n) || n <= 0) return(c(lo = NA_real_, hi = NA_real_))
   p <- m / n
   denom  <- 1 + z^2 / n
@@ -287,10 +292,10 @@ decision_table_final <- decision_table %>%
 # =============================================================================
 
 weight_grid <- expand_grid(
-  w_climate = seq(0.30, 0.90, by = 0.05),
-  w_robust  = seq(0.10, 0.70, by = 0.05)
+  w_climate = seq(SENS_W_CLIMATE_RANGE[1], SENS_W_CLIMATE_RANGE[2], by = SENS_W_STEP),
+  w_robust  = seq(SENS_W_ROBUST_RANGE[1],  SENS_W_ROBUST_RANGE[2],  by = SENS_W_STEP)
 ) %>%
-  filter(abs(w_climate + w_robust - 1) < 1e-9)
+  filter(abs(w_climate + w_robust - 1) < 1e-6)  # 1e-6 tolerance avoids silent
 
 weight_sensitivity <- weight_grid %>%
   mutate(res = pmap(list(w_climate, w_robust), function(wc, wr) {
@@ -324,4 +329,63 @@ write.csv(boot_summary,
 
 saveRDS(decision_set, file.path(output_dir, "decision_set.rds"))
 saveRDS(boot_ranks,   file.path(output_dir, "boot_ranks.rds"))
+
+# =============================================================================
+# 8. RESULT QUALITY SYNTHESIS — consolidated runtime warning
+# =============================================================================
+# See PIPELINE_OUTPUTS_GUIDE.md for full interpretation of each signal.
+
+n_candidates  <- nrow(decision_table_final)
+winner_row    <- decision_table_final %>% slice(1)
+quality_flags <- character(0)
+
+# --- Single-candidate short-circuit ---
+if (n_candidates == 1L) {
+  message(
+    "\nResult quality: SINGLE CANDIDATE — only one candidate survived all screening stages. ",
+    "Bootstrap rank stability (p_top1, rank_IQR) and scoring metrics are uninformative with ",
+    "a single candidate. Evaluate the season definition on scientific grounds. ",
+    "Review filter_results.csv to understand why all other candidates were dropped.")
+} else {
+
+if (is.finite(winner_row$p_top1) && winner_row$p_top1 < 0.50)
+  quality_flags["rank_unstable"] <- sprintf(
+    "Bootstrap rank unstable: winner held rank 1 in %.0f%% of replicates (recommend >= 50%%).",
+    winner_row$p_top1 * 100)
+
+max_components <- 6L  # 4 Tier-1 + 2 Tier-2; no Tier-3 in climate-only pipeline
+if (is.finite(winner_row$score_n_components) &&
+    winner_row$score_n_components < max_components)
+  quality_flags["incomplete_scoring"] <- sprintf(
+    "Winner scored on only %d of %d components. Check whether both threshold methods survived Stage 2.",
+    as.integer(winner_row$score_n_components), max_components)
+
+if (is.finite(winner_row$bsa_min_std_quant) && winner_row$bsa_min_std_quant < 0.50)
+  quality_flags["method_sensitive"] <- sprintf(
+    "Low std/quantile agreement: BSA_min = %.2f (recommend >= 0.50). Classification depends strongly on threshold source.",
+    winner_row$bsa_min_std_quant)
+
+n_weight_winners <- n_distinct(weight_sensitivity$top_candidate)
+if (n_weight_winners > 1) {
+  pct_not_top <- mean(weight_sensitivity$top_candidate != winner_row$candidate_id) * 100
+  if (pct_not_top > SENS_W_WINNER_CHANGE_PCT)
+    quality_flags["weight_sensitive"] <- sprintf(
+      "Winner changes in %.0f%% of weight combinations. Review weight_sensitivity.csv.",
+      pct_not_top)
+}
+
+if (length(quality_flags) == 0) {
+  message("\nResult quality: ACCEPTABLE — no major concerns flagged.")
+} else {
+  message(sprintf(
+    "\nResult quality: CAUTION — %d concern(s) flagged for winner '%s':",
+    length(quality_flags), winner_row$candidate_id))
+  for (nm in names(quality_flags))
+    message("  [", nm, "] ", quality_flags[[nm]])
+  message("\nSee PIPELINE_OUTPUTS_GUIDE.md for interpretation guidance.")
+}
+} # end single-candidate else block
+
+writeLines(capture.output(sessionInfo()),
+           file.path(output_dir, "session_info.txt"))
 # =============================================================================

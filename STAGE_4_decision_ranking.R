@@ -68,6 +68,15 @@ base_tbl <- screened_tbl %>%
          driver       = as.character(driver),
          method       = as.character(method))
 
+# Guard: if Stage 3 dropped all candidates, base_tbl is empty. The bootstrap
+# and weight sensitivity loops would run silently, produce empty/NA outputs,
+# and Section 12 would crash accessing winner_row columns. Stop early with a
+# diagnostic message pointing to filter_results.csv.
+if (nrow(base_tbl) == 0)
+  stop("Stage 4: no candidates survived Stage 3 screening. ",
+       "Review output_STAGE_3/tables/filter_results.csv to identify which ",
+       "drop rules fired and consider relaxing the relevant thresholds in config.")
+
 # Ecological-window level counts
 n_seasons_eco_tbl <- season_long %>%
   semi_join(response_months, by = "DateMonth") %>%
@@ -100,8 +109,11 @@ kappa_safe <- function(tab) {
   (po - pe) / (1 - pe)
 }
 
+# z for 95% two-sided Wilson CI (qnorm(0.975)); named so it can be traced easily
+WILSON_Z <- 1.96
+
 # Wilson score interval for discord proportion
-wilson_ci <- function(m, n, z = 1.96) {
+wilson_ci <- function(m, n, z = WILSON_Z) {
   if (!is.finite(n) || n <= 0) return(c(lo = NA_real_, hi = NA_real_))
   p <- m / n
   denom  <- 1 + z^2 / n
@@ -213,7 +225,7 @@ stage2_best_match <- function(cid, drv, kk) {
              stage2_discord_ci_hi = met$discord_ci_hi,
              bsa_min_ssa = met$bsa_min, kappa_ssa = met$kappa,
              stage2_pmax = pmax2,
-             stage2_near_constant = is.finite(pmax2) && pmax2 > 0.95)
+             stage2_near_constant = is.finite(pmax2) && pmax2 > S4_NEAR_CONSTANT_THRESHOLD)
     }) %>% ungroup() %>%
     arrange(desc(kappa_ssa), desc(bsa_min_ssa), desc(stage2_n)) %>%
     slice(1) %>%
@@ -424,7 +436,7 @@ recompute_boot_components <- function(months_full_b, months_response_b) {
                  stage2_discord_ci_hi = met$discord_ci_hi,
                  bsa_min_ssa = met$bsa_min, kappa_ssa = met$kappa,
                  stage2_pmax = pmax2,
-                 stage2_near_constant = is.finite(pmax2) && pmax2 > 0.95)
+                 stage2_near_constant = is.finite(pmax2) && pmax2 > S4_NEAR_CONSTANT_THRESHOLD)
         }) %>% ungroup() %>%
         arrange(desc(kappa_ssa), desc(bsa_min_ssa), desc(stage2_n)) %>%
         slice(1) %>% mutate(stage2_reason = "ok") %>%
@@ -440,6 +452,16 @@ boot_once <- function() {
   months_full_b <- boot_months(season_long, years_full)
   months_response_b <- boot_months(response_months, years_response)
   comps <- recompute_boot_components(months_full_b, months_response_b)
+  # Design note: Tier 1 (climate structure) components are taken from the
+  # original decision_set — they are computed from the full climate record
+  # and do not vary by year sample, so resampling would add no signal.
+  # nce_ssa (Tier 3, structural partition alignment) is also taken from the
+  # original decision_set: it measures the geometric relationship between
+  # Stage 1 thresholds and Stage 2 breakpoints on the driver axis, which is
+  # a fixed property of those two fits, independent of which years are drawn.
+  # bsa_min_ssa (Tier 3, label agreement) IS resampled — it depends on which
+  # ecological months are present in the bootstrap window.
+  # This asymmetry is intentional: only year-dependent quantities are resampled.
   decision_set %>%
     dplyr::select(candidate_id, driver, k,
                   mean_month_consistency, min_month_consistency,
@@ -500,10 +522,10 @@ decision_table_final <- decision_table %>%
 # =============================================================================
 
 weight_grid <- expand.grid(
-  w_clim = seq(0.3, 0.7, by = 0.1),
-  w_rob  = seq(0.1, 0.4, by = 0.1)) %>%
+  w_clim = seq(SENS_W_CLIMATE_RANGE[1], SENS_W_CLIMATE_RANGE[2], by = SENS_W_STEP),
+  w_rob  = seq(SENS_W_ROBUST_RANGE[1],  SENS_W_ROBUST_RANGE[2],  by = SENS_W_STEP)) %>%
   mutate(w_ver = 1 - w_clim - w_rob) %>%
-  filter(w_ver >= 0.1, w_ver <= 0.4)
+  filter(w_ver >= SENS_W_VERIFY_RANGE[1], w_ver <= SENS_W_VERIFY_RANGE[2])
 
 weight_sensitivity <- weight_grid %>%
   pmap_dfr(function(w_clim, w_rob, w_ver) {
@@ -555,4 +577,97 @@ write.csv(boot_summary,
 # RDS objects for publication outputs
 saveRDS(decision_set,  file.path(output_dir, "decision_set.rds"))
 saveRDS(boot_ranks,    file.path(output_dir, "boot_ranks.rds"))
+
+# =============================================================================
+# 12. RESULT QUALITY SYNTHESIS — consolidated runtime warning when key signals
+#     co-occur to suggest the result should be treated with caution
+# =============================================================================
+# Each check is independent. Multiple flags indicate accumulating uncertainty.
+# Thresholds below are conservative starting points, not hard pass/fail rules.
+# See PIPELINE_OUTPUTS_GUIDE.md for full interpretation of each signal.
+
+n_candidates  <- nrow(decision_table_final)
+winner_row    <- decision_table_final %>% slice(1)
+quality_flags <- character(0)
+
+# --- Single-candidate short-circuit ---
+if (n_candidates == 1L) {
+  message(
+    "\nResult quality: SINGLE CANDIDATE — only one candidate survived all screening stages. ",
+    "Bootstrap rank stability (p_top1, rank_IQR) and scoring metrics are uninformative with ",
+    "a single candidate. Evaluate the season definition on scientific grounds. ",
+    "Review filter_results.csv to understand why all other candidates were dropped.")
+} else {
+
+# --- Rank stability ---
+if (is.finite(winner_row$p_top1) && winner_row$p_top1 < 0.50)
+  quality_flags["rank_unstable"] <- sprintf(
+    "Bootstrap rank unstable: winner held rank 1 in %.0f%% of replicates (recommend >= 50%%).",
+    winner_row$p_top1 * 100)
+
+# --- Score completeness ---
+if (is.finite(winner_row$score_n_components) && winner_row$score_n_components < 8)
+  quality_flags["incomplete_scoring"] <- sprintf(
+    "Winner scored on only %d of 8 components. Missing components mean one or more evidence tiers could not be computed. Check ssa_reason and whether both threshold methods survived Stage 3.",
+    as.integer(winner_row$score_n_components))
+
+# --- Method robustness ---
+if (is.finite(winner_row$bsa_min_std_quant) && winner_row$bsa_min_std_quant < 0.50)
+  quality_flags["method_sensitive"] <- sprintf(
+    "Low std/quantile agreement: BSA_min = %.2f (recommend >= 0.50). Classification outcome depends strongly on threshold source.",
+    winner_row$bsa_min_std_quant)
+
+# --- Ecological cross-validation ---
+if (is.finite(winner_row$bsa_min_ssa) && winner_row$bsa_min_ssa < 0.30)
+  quality_flags["poor_eco_agreement"] <- sprintf(
+    "Low Stage 1 vs Stage 2 label agreement: BSA_min = %.2f (recommend >= 0.30). Climate threshold and ecological breakpoint classify months differently.",
+    winner_row$bsa_min_ssa)
+
+if (isTRUE(winner_row$stage2_near_constant))
+  quality_flags["near_constant_stage2"] <-
+    "Stage 2 ecological labels are near-constant for the winner's driver x k. BSA_min_ssa and nce_ssa are unreliable; rely on Tier 1 and Tier 2 scores only."
+
+# --- Ecological breakpoint support ---
+if (all(!seg_tbl$breakpoint_supported))
+  quality_flags["no_eco_breakpoint"] <- paste0(
+    "No ecological breakpoint detected in any driver (all breakpoint_supported = FALSE). ",
+    "Possible causes: (1) no detectable seasonality in the response; (2) ecological record ",
+    "too short; (3) wrong response variable or transformation; (4) high inter-annual variability. ",
+    "Investigate segmentation_results.csv and RESPONSE_CSV.")
+
+# --- Ecological effect size (from Stage 3 retained diagnostics) ---
+winner_omega <- retained %>%
+  filter(candidate_id == winner_row$candidate_id) %>%
+  pull(anova_omega_sq)
+winner_omega <- if (length(winner_omega) > 0 && is.finite(winner_omega[1])) winner_omega[1] else NA_real_
+if (is.finite(winner_omega) && winner_omega < S3_FLAG_OMEGA_SQ_LOW)
+  quality_flags["low_eco_effect"] <- sprintf(
+    "Weak ecological differentiation: omega_sq = %.4f for winner (flagged below %.2f). Season classification explains little variance in the ecological response.",
+    winner_omega, S3_FLAG_OMEGA_SQ_LOW)
+
+# --- Weight sensitivity ---
+n_weight_winners <- n_distinct(weight_sensitivity$top_candidate)
+if (n_weight_winners > 1) {
+  pct_not_top <- mean(weight_sensitivity$top_candidate != winner_row$candidate_id) * 100
+  if (pct_not_top > SENS_W_WINNER_CHANGE_PCT)
+    quality_flags["weight_sensitive"] <- sprintf(
+      "Winner changes in %.0f%% of weight combinations. The result is sensitive to tier weight choice. Review weight_sensitivity.csv.",
+      pct_not_top)
+}
+
+# --- Emit consolidated summary ---
+if (length(quality_flags) == 0) {
+  message("\nResult quality: ACCEPTABLE — no major concerns flagged.")
+} else {
+  message(sprintf(
+    "\nResult quality: CAUTION — %d concern(s) flagged for winner '%s':",
+    length(quality_flags), winner_row$candidate_id))
+  for (nm in names(quality_flags))
+    message("  [", nm, "] ", quality_flags[[nm]])
+  message("\nSee PIPELINE_OUTPUTS_GUIDE.md for interpretation guidance.")
+}
+} # end single-candidate else block
+
+writeLines(capture.output(sessionInfo()),
+           file.path(output_dir, "session_info.txt"))
 # =============================================================================
